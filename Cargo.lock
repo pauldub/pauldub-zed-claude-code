@@ -2823,6 +2823,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f46ad14479a25103f283c0f10005961cf086d8dc42205bb44c46ac563475dca6"
 
 [[package]]
+name = "claude_code"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "collections",
+ "credentials_provider",
+ "futures 0.3.31",
+ "gpui",
+ "http_client",
+ "icons",
+ "language_model",
+ "log",
+ "parking_lot",
+ "phf",
+ "schemars",
+ "serde",
+ "serde_json",
+ "settings",
+ "smol",
+ "theme",
+ "thiserror 2.0.12",
+ "ui",
+ "util",
+ "which 6.0.3",
+]
+
+[[package]]
 name = "cli"
 version = "0.1.0"
 dependencies = [
@@ -7881,6 +7909,7 @@ dependencies = [
  "aws-credential-types",
  "aws_http_client",
  "bedrock",
+ "claude_code",
  "client",
  "collections",
  "copilot",
@@ -7916,6 +7945,7 @@ dependencies = [
  "tokio",
  "ui",
  "util",
+ "which 6.0.3",
  "workspace-hack",
  "zed_llm_client",
 ]

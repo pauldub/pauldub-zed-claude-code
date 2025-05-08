@@ -1,21 +1,19 @@
 use anyhow::{Result, anyhow};
 use claude_code::{ClaudeCodeModel, Model};
-use editor::{Editor, EditorElement, EditorStyle};
-use gpui::{
-    AnyView, App, AsyncApp, Context, Entity, FontStyle, Render, Subscription, Task, TextStyle,
-    WhiteSpace, Window, div, prelude::*,
-};
+use gpui::{AnyView, App, Context, Entity, Render, Subscription, Task, Window, div, prelude::*};
 use language_model::{
     AuthenticateError, LanguageModel, LanguageModelProvider, LanguageModelProviderId,
     LanguageModelProviderName, LanguageModelProviderState,
 };
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore};
 use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
 };
-use ui::{Button, Color, Icon, Label, List, h_flex, prelude::*, v_flex};
+use ui::{Color, Icon, Label, List, h_flex, prelude::*, v_flex};
 
 use crate::{AllLanguageModelSettings, ui::InstructionListItem};
 
@@ -25,7 +23,7 @@ pub const PROVIDER_NAME: &str = "Claude Code";
 pub const CLAUDE_CLI_COMMAND: &str = "claude"; // The actual command to run
 
 // Settings for the Claude Code provider
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ClaudeCodeSettings {
     /// Path to the Claude CLI executable, if it's not in the default location or PATH
     pub cli_path: Option<String>,
@@ -44,7 +42,8 @@ impl ClaudeCodeSettings {
         if let Some(path) = &self.cli_path {
             PathBuf::from(path)
         } else {
-            PathBuf::from(CLAUDE_CLI_COMMAND) // Use the command name directly, let the OS find it in PATH
+            let cli_path = which::which("claude");
+            cli_path.unwrap_or(PathBuf::from("claude"))
         }
     }
 
@@ -128,24 +127,20 @@ impl ClaudeCodeProviderState {
             .clone()
             .unwrap_or_else(|| CLAUDE_CLI_COMMAND.to_string());
 
-        cx.spawn(async move |this, cx| {
-            let output = match Command::new(&cmd_name).arg("--version").output() {
-                Ok(output) if output.status.success() => {
-                    // Parse version from output
-                    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    Some(version)
-                }
-                _ => None,
-            };
+        let output = match Command::new(&cmd_name).arg("--version").output() {
+            Ok(output) if output.status.success() => {
+                // Parse version from output
+                let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                Some(version)
+            }
+            _ => None,
+        };
 
-            this.update(|this, cx| {
-                this.cli_available = output.is_some();
-                this.cli_version = output;
-                this.checking_cli = false;
-                cx.notify();
-                Ok(())
-            })?;
-        })
+        self.cli_available = output.is_some();
+        self.cli_version = output;
+        self.checking_cli = false;
+
+        cx.spawn(async |this, cx| this.update(cx, |_, cx| cx.notify()))
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -160,15 +155,18 @@ impl ClaudeCodeProviderState {
         // For Claude CLI, authentication just means checking if the CLI is available
         cx.spawn(async move |this, cx| {
             // Make a mutable update to start checking
-            this.update(cx, |this, cx| {
+            let _ = this.update(cx, |this, cx| -> Result<(), AuthenticateError> {
                 if !this.checking_cli {
                     this.checking_cli = true;
                     cx.notify();
                 }
                 Ok(())
-            });
+            })?;
 
-            let cmd_name = this.read(cx).cli_path.clone().unwrap_or_else(|| CLAUDE_CLI_COMMAND.to_string());
+            let cmd_name =
+                this.read_with(cx, |this, _cx| {
+                    this.cli_path.clone()
+                }).unwrap_or(None).unwrap_or_else(|| CLAUDE_CLI_COMMAND.to_string());
 
             // Check CLI availability
             let output = Command::new(&cmd_name).arg("--version").output();
@@ -178,7 +176,7 @@ impl ClaudeCodeProviderState {
                     // Parse version from output
                     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-                    this.update(cx, |this, cx| {
+                    let _ = this.update(cx, |this, cx| -> Result<(), AuthenticateError> {
                         this.cli_available = true;
                         this.cli_version = Some(version);
                         this.checking_cli = false;
@@ -189,7 +187,7 @@ impl ClaudeCodeProviderState {
                     Ok(())
                 }
                 _ => {
-                    this.update(cx, |this, cx| {
+                    let _ = this.update(cx, |this, cx| -> Result<(), AuthenticateError> {
                         this.cli_available = false;
                         this.cli_version = None;
                         this.checking_cli = false;
@@ -203,37 +201,6 @@ impl ClaudeCodeProviderState {
                 }
             }
         })
-    }
-
-    fn save_cli_path(&mut self, path: String, cx: &mut Context<Self>) -> Result<()> {
-        let is_empty = path.trim().is_empty();
-        let new_value = if is_empty { None } else { Some(path) };
-
-        // Only update if changed
-        if self.cli_path != new_value {
-            // Update state first
-            self.cli_path = new_value.clone();
-            cx.notify();
-
-            // Check CLI availability with new path
-            self.check_cli_availability(cx).detach_and_log_err(cx);
-
-            // Get fs from the app
-            let fs = cx.global::<settings::ProjectSettings>().fs.clone();
-
-            // Update settings file
-            update_settings_file::<AllLanguageModelSettings>(
-                fs,
-                cx.app_context(),
-                move |settings, _| {
-                    settings.claude_code.cli_path = new_value;
-                },
-            );
-
-            Ok(())
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -296,8 +263,8 @@ impl LanguageModelProvider for ClaudeCodeProvider {
         self.state.update(cx, |state, cx| state.authenticate(cx))
     }
 
-    fn configuration_view(&self, window: &mut Window, cx: &mut App) -> AnyView {
-        cx.new(|cx| ConfigurationView::new(self.state.clone(), window, cx))
+    fn configuration_view(&self, _window: &mut Window, cx: &mut App) -> AnyView {
+        cx.new(|_cx| ConfigurationView::new(self.state.clone()))
             .into()
     }
 
@@ -314,123 +281,18 @@ impl LanguageModelProvider for ClaudeCodeProvider {
 // Configuration view implementation
 struct ConfigurationView {
     state: Entity<ClaudeCodeProviderState>,
-    cli_path_editor: Entity<Editor>,
-    checking_task: Option<Task<()>>,
 }
 
 impl ConfigurationView {
-    const PLACEHOLDER_TEXT: &'static str = "path/to/claude or leave empty to use PATH";
-
-    fn new(
-        state: Entity<ClaudeCodeProviderState>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        // Observe state for changes
-        cx.observe(&state, |_, _, cx| {
-            cx.notify();
-        })
-        .detach();
-
-        // Create an editor for the CLI path input
-        let cli_path_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text(Self::PLACEHOLDER_TEXT, cx);
-            if let Some(path) = state.read(cx).cli_path.clone() {
-                editor.set_text(path, window, cx);
-            }
-            editor
-        });
-
-        // Create a task to check CLI availability
-        let checking_task = Some(cx.spawn({
-            let state = state.clone();
-            async move |this, cx| {
-                state
-                    .update(cx, |state, cx| {
-                        state.check_cli_availability(cx).detach_and_log_err(cx);
-                    })
-                    .ok();
-
-                this.update(cx, |this, cx| {
-                    this.checking_task = None;
-                    cx.notify();
-                })
-                .ok();
-            }
-        }));
-
-        Self {
-            state,
-            cli_path_editor,
-            checking_task,
-        }
-    }
-
-    fn save_cli_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let cli_path = self.cli_path_editor.read(cx).text(cx).to_string();
-
-        let state = self.state.clone();
-        cx.spawn_in(window, async move |_, cx| {
-            state
-                .update(cx, |state, cx| state.save_cli_path(cli_path, cx))?
-                .await
-        })
-        .detach_and_log_err(cx);
-
-        cx.notify();
-    }
-
-    fn check_cli_again(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let state = self.state.clone();
-        self.checking_task = Some(cx.spawn(async move |this, cx| {
-            state
-                .update(cx, |state, cx| {
-                    state.check_cli_availability(cx).detach_and_log_err(cx);
-                })
-                .ok();
-
-            this.update(cx, |this, cx| {
-                this.checking_task = None;
-                cx.notify();
-            })
-            .ok();
-        }));
-
-        cx.notify();
-    }
-
-    fn render_cli_path_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let settings = theme::ThemeSettings::get_global(cx);
-        let text_style = TextStyle {
-            color: cx.theme().colors().text,
-            font_family: settings.ui_font.family.clone(),
-            font_features: settings.ui_font.features.clone(),
-            font_fallbacks: settings.ui_font.fallbacks.clone(),
-            font_size: rems(0.875).into(),
-            font_weight: settings.ui_font.weight,
-            font_style: FontStyle::Normal,
-            line_height: relative(1.3),
-            white_space: WhiteSpace::Normal,
-            ..Default::default()
-        };
-
-        EditorElement::new(
-            &self.cli_path_editor,
-            EditorStyle {
-                background: cx.theme().colors().editor_background,
-                local_player: cx.theme().players().local(),
-                text: text_style,
-                ..Default::default()
-            },
-        )
+    fn new(state: Entity<ClaudeCodeProviderState>) -> Self {
+        Self { state }
     }
 }
 
 impl Render for ConfigurationView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
-        let checking = state.checking_cli || self.checking_task.is_some();
+        let checking = state.checking_cli;
 
         v_flex()
             .gap_4()
@@ -454,35 +316,6 @@ impl Render for ConfigurationView {
                     )
                     .child(
                         InstructionListItem::text_only("Provide the path to the Claude CLI below (or leave empty to use the system PATH)")
-                    )
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .my_2()
-                    .px_2()
-                    .py_1()
-                    .bg(cx.theme().colors().editor_background)
-                    .border_1()
-                    .border_color(cx.theme().colors().border)
-                    .rounded_sm()
-                    .child(self.render_cli_path_editor(cx))
-            )
-            .child(
-                h_flex()
-                    .gap_4()
-                    .child(
-                        Button::new("save-path", "Save Path")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.save_cli_path(window, cx);
-                            }))
-                    )
-                    .child(
-                        Button::new("check-again", "Check CLI")
-                            .disabled(checking)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.check_cli_again(window, cx);
-                            }))
                     )
             )
             .child(

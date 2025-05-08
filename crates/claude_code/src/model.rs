@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context as _, Result};
-use futures::{future::BoxFuture, stream::BoxStream, StreamExt};
+use futures::Stream;
+use futures::{future::BoxFuture, stream::BoxStream, FutureExt, StreamExt};
 use gpui::{App, AsyncApp};
 use language_model::{
     LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelId,
@@ -7,12 +8,12 @@ use language_model::{
     LanguageModelToolSchemaFormat, LanguageModelToolUse, StopReason, TokenUsage,
 };
 use log::{debug, error, warn};
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{process::Stdio, sync::Arc, time::Duration};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Child;
+use smol::io::{AsyncBufReadExt, BufReader};
+use smol::process::Child;
+use std::{process::Stdio, time::Duration};
+use util::command;
 
 use crate::tools;
 
@@ -79,11 +80,11 @@ impl CliRunner {
         }
     }
 
-    pub async fn run_command(&self, prompt: &str) -> Result<Child> {
+    pub fn run_command(&self, prompt: &str) -> Result<Child> {
         debug!("Running Claude CLI with prompt: {}", prompt);
 
         // Build the command
-        let mut cmd = tokio::process::Command::new(&self.cli_path);
+        let mut cmd = command::new_smol_command(&self.cli_path);
 
         // Add default arguments
         for arg in &self.default_args {
@@ -167,6 +168,233 @@ enum ClaudeToolResult {
     },
 }
 
+/// Event mapper for Claude CLI responses
+pub struct ClaudeCliEventMapper {
+    token_usage: TokenUsage,
+    json_buffer: String,
+}
+
+impl ClaudeCliEventMapper {
+    pub fn new() -> Self {
+        Self {
+            token_usage: TokenUsage::default(),
+            json_buffer: String::new(),
+        }
+    }
+
+    pub fn map_stream(
+        mut self,
+        reader: BufReader<impl smol::io::AsyncRead + Unpin>,
+    ) -> impl Stream<Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>
+    {
+        // Create a lines stream from the reader
+        let lines_stream = async_stream::stream! {
+            let mut line = String::new();
+            let mut buf_reader = reader;
+
+            loop {
+                line.clear();
+                match buf_reader.read_line(&mut line).await {
+                    Ok(0) => break, // EOF
+                    Ok(_) => yield Ok(line.clone()),
+                    Err(e) => {
+                        yield Err(anyhow::anyhow!(e).into());
+                        break;
+                    }
+                }
+            }
+        };
+
+        // Map each line to events
+        lines_stream.flat_map(move |line_result| {
+            futures::stream::iter(match line_result {
+                Ok(line) => self.map_line(line),
+                Err(e) => vec![Err(LanguageModelCompletionError::Other(e))],
+            })
+        })
+    }
+
+    fn map_line(
+        &mut self,
+        line: String,
+    ) -> Vec<Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> {
+        // Skip empty lines
+        if line.trim().is_empty() {
+            return Vec::new();
+        }
+
+        // Accumulate JSON and try to parse it
+        match self.accumulate_and_parse_json(&line) {
+            Ok(Some(events)) => events.into_iter().map(Ok).collect(),
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                error!("Error parsing Claude CLI output: {:?}", e);
+                vec![Err(LanguageModelCompletionError::Other(e))]
+            }
+        }
+    }
+
+    /// Accumulate lines until we have a complete JSON object, then parse it
+    fn accumulate_and_parse_json(
+        &mut self,
+        line: &str,
+    ) -> Result<Option<Vec<LanguageModelCompletionEvent>>> {
+        // Remove "data: " prefix if present (used in SSE format)
+        let json_str = line.trim_start_matches("data: ").trim();
+
+        if json_str.is_empty() {
+            return Ok(None);
+        }
+
+        // Special case: if the line itself is a complete JSON object, try to parse it directly
+        if (json_str.starts_with("{") && json_str.ends_with("}"))
+            || (json_str.starts_with("[") && json_str.ends_with("]"))
+        {
+            if let Some(events) = self.parse_claude_json_object(json_str)? {
+                return Ok(Some(events));
+            }
+        }
+
+        // Add a safety limit to prevent buffer from growing too large (1MB limit)
+        const MAX_BUFFER_SIZE: usize = 1 * 1024 * 1024;
+
+        // If the buffer is getting too large, log an error and reset it
+        if self.json_buffer.len() + json_str.len() > MAX_BUFFER_SIZE {
+            warn!(
+                "JSON buffer exceeded max size ({}KB), resetting",
+                MAX_BUFFER_SIZE / 1024
+            );
+            self.json_buffer.clear();
+        }
+
+        // Otherwise, accumulate the JSON
+        self.json_buffer.push_str(json_str);
+        self.json_buffer.push('\n');
+
+        // Check if we have a complete JSON object by counting braces
+        let mut open_braces = 0;
+        let mut inside_string = false;
+        let mut escape_next = false;
+
+        for c in self.json_buffer.chars() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+
+            match c {
+                '\\' if inside_string => escape_next = true,
+                '"' => inside_string = !inside_string,
+                '{' if !inside_string => open_braces += 1,
+                '}' if !inside_string => open_braces -= 1,
+                _ => {}
+            }
+        }
+
+        // If we have a complete JSON object, try to parse it
+        if open_braces == 0 && !self.json_buffer.is_empty() {
+            // Try to parse the JSON
+            if let Some(events) = self.parse_claude_json_object(&self.json_buffer)? {
+                debug!(
+                    "Successfully parsed complete JSON object ({} chars, {} events)",
+                    self.json_buffer.len(),
+                    events.len()
+                );
+                // Clear the buffer
+                self.json_buffer.clear();
+                return Ok(Some(events));
+            }
+        }
+
+        // Not a complete JSON object yet
+        Ok(None)
+    }
+
+    fn parse_claude_json_object(
+        &self,
+        json_str: &str,
+    ) -> Result<Option<Vec<LanguageModelCompletionEvent>>> {
+        let mut events = Vec::new();
+
+        // Try to parse as a Claude message
+        if let Ok(message) = serde_json::from_str::<ClaudeMessage>(json_str) {
+            debug!("Successfully parsed Claude message with id: {}", message.id);
+
+            // Create token usage instead of updating internal state
+            let token_usage = TokenUsage {
+                input_tokens: message.usage.input_tokens,
+                output_tokens: message.usage.output_tokens,
+                ..Default::default()
+            };
+
+            // Add usage update event with the created token usage
+            events.push(LanguageModelCompletionEvent::UsageUpdate(token_usage));
+
+            // Process message content
+            if let Some(content) = message.content.first() {
+                match content {
+                    ClaudeContent::Text { text } => {
+                        events.push(LanguageModelCompletionEvent::Text(text.clone()));
+                    }
+                    ClaudeContent::ToolUse { id, name, input } => {
+                        let raw_input = serde_json::to_string(input).unwrap_or_default();
+                        events.push(LanguageModelCompletionEvent::ToolUse(
+                            LanguageModelToolUse {
+                                id: id.clone().into(),
+                                name: name.as_str().into(),
+                                raw_input: raw_input.clone(),
+                                input: input.clone(),
+                                is_input_complete: true,
+                            },
+                        ));
+                    }
+                }
+            }
+
+            // Check for stop reason
+            if let Some(stop_reason) = message.stop_reason {
+                events.push(LanguageModelCompletionEvent::Stop(
+                    match stop_reason.as_str() {
+                        "tool_use" => StopReason::ToolUse,
+                        "max_tokens" => StopReason::MaxTokens,
+                        _ => StopReason::EndTurn,
+                    },
+                ));
+            }
+
+            return Ok(Some(events));
+        }
+
+        // Try to parse as a user response (tool result)
+        if let Ok(_user_response) = serde_json::from_str::<ClaudeUserResponse>(json_str) {
+            // We don't usually need to process these, as they're echoed back from our side
+            debug!("Parsed user response (tool result)");
+            return Ok(None);
+        }
+
+        // If it looks like a JSON fragment, it's likely part of a larger JSON object
+        if (json_str.trim().starts_with("{") || json_str.trim().starts_with("["))
+            && !(json_str.trim().ends_with("}") || json_str.trim().ends_with("]"))
+        {
+            debug!("Received partial JSON fragment, continuing to accumulate");
+        } else {
+            // Log a helpful message about the parsing failure
+            let preview = if json_str.len() > 100 {
+                format!("{}... (truncated)", &json_str[..100])
+            } else {
+                json_str.to_string()
+            };
+            debug!(
+                "Couldn't parse Claude CLI JSON object ({} chars): {}",
+                json_str.len(),
+                preview
+            );
+        }
+
+        Ok(None)
+    }
+}
+
 impl ClaudeCodeModel {
     pub fn new(model: Model, runner: CliRunner) -> Self {
         Self {
@@ -179,136 +407,6 @@ impl ClaudeCodeModel {
     pub fn with_default_runner(model: Model) -> Self {
         Self::new(model, CliRunner::default())
     }
-
-    fn parse_claude_cli_output(
-        &self,
-        mut process: Child,
-    ) -> BoxStream<'static, Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>
-    {
-        // Get stdout and create a buffered reader
-        let stdout = process
-            .stdout
-            .take()
-            .expect("Failed to get stdout from process");
-
-        let token_usage = Arc::new(Mutex::new(TokenUsage::default()));
-
-        // Create a stream from stdout lines
-        let reader = BufReader::new(stdout);
-
-        // Capture token_usage in a clone before the unfold closure
-        let token_usage_clone = token_usage.clone();
-
-        // Use a simple stream to process each line
-        let stream = futures::stream::unfold(reader, move |mut reader| {
-            // Clone again inside the closure for each iteration
-            let token_usage_ref = token_usage_clone.clone();
-
-            async move {
-                let mut line = String::new();
-                match reader.read_line(&mut line).await {
-                    Ok(0) => None, // EOF
-                    Ok(_) => {
-                        let result = if line.trim().is_empty() {
-                            Ok(LanguageModelCompletionEvent::UsageUpdate(
-                                TokenUsage::default(),
-                            ))
-                        } else {
-                            match parse_claude_json_line(&line, &token_usage_ref) {
-                                Ok(Some(event)) => Ok(event),
-                                Ok(None) => Ok(LanguageModelCompletionEvent::UsageUpdate(
-                                    TokenUsage::default(),
-                                )),
-                                Err(e) => {
-                                    error!("Error parsing Claude CLI output: {:?}", e);
-                                    Err(LanguageModelCompletionError::Other(e))
-                                }
-                            }
-                        };
-                        Some((result, reader))
-                    }
-                    Err(e) => {
-                        error!("Error reading Claude CLI output: {:?}", e);
-                        Some((Err(LanguageModelCompletionError::Other(anyhow!(e))), reader))
-                    }
-                }
-            }
-        })
-        .boxed();
-
-        stream
-    }
-}
-
-fn parse_claude_json_line(
-    line: &str,
-    token_usage: &Arc<Mutex<TokenUsage>>,
-) -> Result<Option<LanguageModelCompletionEvent>> {
-    // Remove "data: " prefix if present (used in SSE format)
-    let json_str = line.trim_start_matches("data: ").trim();
-
-    if json_str.is_empty() {
-        return Ok(None);
-    }
-
-    // Try to parse as a Claude message
-    if let Ok(message) = serde_json::from_str::<ClaudeMessage>(json_str) {
-        // Process the message based on its content
-        if let Some(content) = message.content.first() {
-            match content {
-                ClaudeContent::Text { text } => {
-                    return Ok(Some(LanguageModelCompletionEvent::Text(text.clone())));
-                }
-                ClaudeContent::ToolUse { id, name, input } => {
-                    let raw_input = serde_json::to_string(input).unwrap_or_default();
-                    return Ok(Some(LanguageModelCompletionEvent::ToolUse(
-                        LanguageModelToolUse {
-                            id: id.clone().into(),
-                            name: name.as_str().into(),
-                            raw_input: raw_input.clone(),
-                            input: input.clone(),
-                            is_input_complete: true,
-                        },
-                    )));
-                }
-            }
-        }
-
-        // Update token usage
-        let mut usage = token_usage.lock();
-        usage.input_tokens = message.usage.input_tokens;
-        usage.output_tokens = message.usage.output_tokens;
-
-        // Check for stop reason
-        if let Some(stop_reason) = message.stop_reason {
-            return Ok(Some(LanguageModelCompletionEvent::Stop(
-                match stop_reason.as_str() {
-                    "tool_use" => StopReason::ToolUse,
-                    "max_tokens" => StopReason::MaxTokens,
-                    _ => StopReason::EndTurn,
-                },
-            )));
-        }
-
-        // If we got here, just send a usage update
-        return Ok(Some(LanguageModelCompletionEvent::UsageUpdate(
-            TokenUsage {
-                input_tokens: message.usage.input_tokens,
-                output_tokens: message.usage.output_tokens,
-                ..Default::default()
-            },
-        )));
-    }
-
-    // Try to parse as a user response (tool result)
-    if let Ok(_user_response) = serde_json::from_str::<ClaudeUserResponse>(json_str) {
-        // We don't usually need to process these, as they're echoed back from our side
-        return Ok(None);
-    }
-
-    // If we couldn't parse the JSON, log it and return None
-    warn!("Couldn't parse Claude CLI JSON: {}", json_str);
-    Ok(None)
 }
 
 impl LanguageModel for ClaudeCodeModel {
@@ -368,25 +466,32 @@ impl LanguageModel for ClaudeCodeModel {
             BoxStream<'static, Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>,
         >,
     > {
-        // Clone the entire model to avoid lifetime issues
-        let model_clone = ClaudeCodeModel {
-            id: self.id.clone(),
-            model: self.model,
-            runner: self.runner.clone(),
-        };
+        // Clone the runner to avoid lifetime issues
+        let runner = self.runner.clone();
 
-        // Move the clone into the async block
-        Box::pin(async move {
-            // Convert the request to a prompt for the Claude CLI
-            let prompt = tools::convert_request_to_prompt(&request);
+        // Convert the request to a prompt for the Claude CLI
+        let prompt = tools::convert_request_to_prompt(&request);
 
-            // Spawn Claude CLI directly
-            let process = model_clone.runner.run_command(&prompt).await?;
+        async move {
+            // Run the Claude CLI command
+            let mut process = runner
+                .run_command(&prompt)
+                .context("Failed to run Claude CLI")?;
 
-            // Parse the JSON output from the process
-            let stream = model_clone.parse_claude_cli_output(process);
+            // Get the stdout from the process
+            let stdout = process
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("Failed to get stdout from Claude CLI process"))?;
 
-            Ok(stream)
-        })
+            // Create a buffered reader from stdout - explicitly wrap to get AsyncBufReadExt
+            let reader = BufReader::new(stdout);
+
+            // Create an event mapper and stream the results
+            let stream = ClaudeCliEventMapper::new().map_stream(reader);
+
+            Ok(stream.boxed())
+        }
+        .boxed()
     }
 }

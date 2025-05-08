@@ -28,10 +28,17 @@ pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
     AllLanguageModelSettings::register(cx);
 
     // Initialize with default timeout for Claude Code if not set
-    if AllLanguageModelSettings::get_global(cx).claude_code.timeout_ms == 0 {
+    if AllLanguageModelSettings::get_global(cx)
+        .claude_code
+        .timeout_ms
+        == 0
+    {
         update_settings_file::<AllLanguageModelSettings>(fs.clone(), cx, move |setting, _| {
-            if setting.claude_code.timeout_ms == 0 {
-                setting.claude_code.timeout_ms = 60000; // Default 60 second timeout
+            if let Some(mut settings) = setting.claude_code.clone() {
+                if settings.timeout_ms == 0 {
+                    settings.timeout_ms = 60000; // Default 60 second timeout
+                }
+                setting.claude_code = Some(settings);
             }
         });
     }
@@ -337,12 +344,9 @@ impl settings::Settings for AllLanguageModelSettings {
                 &mut settings.bedrock.endpoint,
                 bedrock.as_ref().map(|s| s.endpoint_url.clone()),
             );
-            
+
             // Claude Code
-            merge(
-                &mut settings.claude_code,
-                value.claude_code.clone(),
-            );
+            merge(&mut settings.claude_code, value.claude_code.clone());
 
             // Ollama
             let ollama = value.ollama.clone();
