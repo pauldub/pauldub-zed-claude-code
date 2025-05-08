@@ -12,6 +12,7 @@ use crate::provider::{
     self,
     anthropic::AnthropicSettings,
     bedrock::AmazonBedrockSettings,
+    claude_code::ClaudeCodeSettings,
     cloud::{self, ZedDotDevSettings},
     copilot_chat::CopilotChatSettings,
     deepseek::DeepSeekSettings,
@@ -25,6 +26,15 @@ use crate::provider::{
 /// Initializes the language model settings.
 pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
     AllLanguageModelSettings::register(cx);
+
+    // Initialize with default timeout for Claude Code if not set
+    if AllLanguageModelSettings::get_global(cx).claude_code.timeout_ms == 0 {
+        update_settings_file::<AllLanguageModelSettings>(fs.clone(), cx, move |setting, _| {
+            if setting.claude_code.timeout_ms == 0 {
+                setting.claude_code.timeout_ms = 60000; // Default 60 second timeout
+            }
+        });
+    }
 
     if AllLanguageModelSettings::get_global(cx)
         .openai
@@ -59,6 +69,7 @@ pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
 pub struct AllLanguageModelSettings {
     pub anthropic: AnthropicSettings,
     pub bedrock: AmazonBedrockSettings,
+    pub claude_code: ClaudeCodeSettings,
     pub ollama: OllamaSettings,
     pub openai: OpenAiSettings,
     pub zed_dot_dev: ZedDotDevSettings,
@@ -73,6 +84,7 @@ pub struct AllLanguageModelSettings {
 pub struct AllLanguageModelSettingsContent {
     pub anthropic: Option<AnthropicSettingsContent>,
     pub bedrock: Option<AmazonBedrockSettingsContent>,
+    pub claude_code: Option<ClaudeCodeSettings>,
     pub ollama: Option<OllamaSettingsContent>,
     pub lmstudio: Option<LmStudioSettingsContent>,
     pub openai: Option<OpenAiSettingsContent>,
@@ -324,6 +336,12 @@ impl settings::Settings for AllLanguageModelSettings {
             merge(
                 &mut settings.bedrock.endpoint,
                 bedrock.as_ref().map(|s| s.endpoint_url.clone()),
+            );
+            
+            // Claude Code
+            merge(
+                &mut settings.claude_code,
+                value.claude_code.clone(),
             );
 
             // Ollama

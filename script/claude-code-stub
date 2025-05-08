@@ -1,0 +1,69 @@
+#!/bin/bash
+
+# claude-code-stub - A simple stub for claude CLI
+# Mimics the behavior of 'claude -p <prompt> --output-format stream-json'
+
+prompt=""
+output_format="text"
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--prompt)
+      prompt="$2"
+      shift 2
+      ;;
+    --output-format)
+      output_format="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1"
+      exit 1
+      ;;
+  esac
+done
+
+# Check if prompt is provided
+if [ -z "$prompt" ]; then
+  echo "Error: Prompt is required. Use -p or --prompt to provide a prompt."
+  exit 1
+fi
+
+# Function to add a short delay between outputs
+delay() {
+  sleep 1.0
+}
+
+if [ "$output_format" = "stream-json" ]; then
+  # Initial message start
+  echo '{"id":"msg_mock123456","type":"message","role":"assistant","model":"claude-3-7-sonnet-20250219","content":[{"type":"text","text":"I'\''ll analyze the requested information."}],"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":4,"output_tokens":91}}'
+  delay
+
+  # Tool use (looking at files)
+  echo '{"id":"msg_mock123457","type":"message","role":"assistant","model":"claude-3-7-sonnet-20250219","content":[{"type":"text","text":"Let me examine the files to understand the structure:"},{"type":"tool_use","id":"toolu_mock123","name":"LS","input":{"path":"/mock/path"}}],"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":95}}'
+  delay
+
+  # User response with tool result
+  echo '{"role":"user","content":[{"tool_use_id":"toolu_mock123","type":"tool_result","content":"- /mock/path/\n  - src/\n    - main.rs\n    - lib.rs\n"}]}'
+  delay
+
+  # Reading a file
+  echo '{"id":"msg_mock123458","type":"message","role":"assistant","model":"claude-3-7-sonnet-20250219","content":[{"type":"text","text":"Now I'\''ll look at the main code file:"},{"type":"tool_use","id":"toolu_mock124","name":"Read","input":{"file_path":"/mock/path/src/main.rs"}}],"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":6,"output_tokens":100}}'
+  delay
+
+  # User response with file content
+  echo '{"role":"user","content":[{"tool_use_id":"toolu_mock124","type":"tool_result","content":"fn main() {\n    println!(\"Hello, world!\");\n}"}]}'
+  delay
+
+  # Final analysis
+  echo '{"id":"msg_mock123459","type":"message","role":"assistant","model":"claude-3-7-sonnet-20250219","content":[{"type":"text","text":"Based on my analysis, this appears to be a simple Rust project with a standard structure. The main.rs file contains a basic Hello World program. This is typical for a starter Rust project created with `cargo new`. The project seems to be set up correctly and follows standard Rust project conventions."}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":200}}'
+else
+  # Default text output
+  echo "I'll analyze the requested information."
+  echo ""
+  echo "Based on my analysis, this appears to be a simple project with a standard structure."
+  echo "The project seems to be set up correctly and follows standard conventions."
+fi
+
+exit 0

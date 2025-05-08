@@ -12,6 +12,7 @@ pub mod ui;
 
 use crate::provider::anthropic::AnthropicLanguageModelProvider;
 use crate::provider::bedrock::BedrockLanguageModelProvider;
+use crate::provider::claude_code::ClaudeCodeProvider;
 use crate::provider::cloud::CloudLanguageModelProvider;
 use crate::provider::copilot_chat::CopilotChatLanguageModelProvider;
 use crate::provider::google::GoogleLanguageModelProvider;
@@ -73,4 +74,5 @@ fn register_language_model_providers(
         cx,
     );
     registry.register_provider(CopilotChatLanguageModelProvider::new(cx), cx);
+    registry.register_provider(ClaudeCodeProvider::new(cx), cx);
 }
